@@ -1,0 +1,20 @@
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables (Crucial for security)
+.env
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Vector database cache
+faiss_index/
+
+# OS specific files
+.DS_Store
+Thumbs.db
