@@ -1,34 +1,55 @@
 import streamlit as st
 import os
 from dotenv import load_dotenv
-from PyPDF2 import PdfReader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from pypdf import PdfReader
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-def get_pdf_text(pdf_docs):
-    text = ""
+def get_pdf_pages(pdf_docs):
+    """One Document per PDF page, tagged with file name and page number for citations."""
+    pages = []
     for pdf in pdf_docs:
         pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
+        for page_no, page in enumerate(pdf_reader.pages, start=1):
             page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    return text
+            if page_text and page_text.strip():
+                pages.append(Document(page_content=page_text,
+                                      metadata={"source": pdf.name, "page": page_no}))
+    return pages
 
-def get_text_chunks(text):
-    text_splitter = CharacterTextSplitter(
-        separator="\n",
+def get_text_chunks(pages):
+    # Splits on paragraphs first, then sentences, then words, so chunks stay coherent.
+    text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200,
         length_function=len
     )
-    chunks = text_splitter.split_text(text)
-    return chunks
+    return text_splitter.split_documents(pages)
+
+def format_sources(docs):
+    """Unique (file, page, snippet) entries for the chunks the answer was based on."""
+    seen, sources = set(), []
+    for doc in docs:
+        key = (doc.metadata.get("source"), doc.metadata.get("page"))
+        if key in seen:
+            continue
+        seen.add(key)
+        snippet = " ".join(doc.page_content.split())[:220]
+        sources.append({"source": key[0], "page": key[1], "snippet": snippet})
+    return sources
+
+def render_sources(sources):
+    if not sources:
+        return
+    with st.expander(f"Sources ({len(sources)})"):
+        for s in sources:
+            st.markdown(f"**{s['source']}**, page {s['page']}  \n> {s['snippet']}...")
 
 def get_vectorstore(text_chunks):
     try:
@@ -37,7 +58,7 @@ def get_vectorstore(text_chunks):
             model_name="all-MiniLM-L6-v2",
             model_kwargs={'device': 'cpu'}
         )
-        vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
+        vectorstore = FAISS.from_documents(text_chunks, embedding=embeddings)
         return vectorstore
     except Exception as e:
         st.error(f"Error creating vectorstore: {str(e)}")
@@ -54,7 +75,7 @@ def get_conversation_chain(vectorstore, provider, api_key):
         elif provider == "Google Gemini":
             llm = ChatGoogleGenerativeAI(
                 google_api_key=api_key,
-                model="gemini-1.5-flash",
+                model="gemini-2.5-flash",
                 temperature=0.3
             )
         else:
@@ -165,14 +186,14 @@ def main():
                 st.warning("Please upload at least one PDF document.")
             else:
                 with st.spinner("Processing documents..."):
-                    # Extract text
-                    raw_text = get_pdf_text(pdf_docs)
-                    if not raw_text.strip():
+                    # Extract text page by page
+                    pages = get_pdf_pages(pdf_docs)
+                    if not pages:
                         st.error("No readable text could be extracted. The PDFs might be empty or scanned images.")
                         st.stop()
                     
                     # Split into chunks
-                    text_chunks = get_text_chunks(raw_text)
+                    text_chunks = get_text_chunks(pages)
                     
                     # Create vector store
                     vectorstore = get_vectorstore(text_chunks)
@@ -182,7 +203,7 @@ def main():
                         st.session_state.conversation = get_conversation_chain(vectorstore, provider, api_key)
                         if st.session_state.conversation:
                             st.session_state.processed_files = [pdf.name for pdf in pdf_docs]
-                            st.success("Documents successfully processed! You can now start chatting.")
+                            st.success(f"Processed {len(pages)} pages into {len(text_chunks)} chunks. You can start chatting.")
         
         # Status/Processed files list
         if st.session_state.processed_files:
@@ -210,6 +231,7 @@ def main():
         role = "user" if message["role"] == "user" else "assistant"
         with st.chat_message(role):
             st.markdown(message["content"])
+            render_sources(message.get("sources", []))
 
     # Chat Input Box at the bottom
     user_question = st.chat_input("Ask a question about your documents...")
@@ -227,11 +249,13 @@ def main():
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
                     try:
-                        response = st.session_state.conversation({'question': user_question})
+                        response = st.session_state.conversation.invoke({'question': user_question})
                         answer = response['answer']
+                        sources = format_sources(response.get('source_documents', []))
                         st.markdown(answer)
-                        # Append assistant response
-                        st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                        render_sources(sources)
+                        st.session_state.chat_history.append(
+                            {"role": "assistant", "content": answer, "sources": sources})
                     except Exception as e:
                         st.error(f"Error generating answer: {str(e)}")
 
